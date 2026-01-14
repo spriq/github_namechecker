@@ -17,3 +17,4 @@
 ## 运行代码：
 ```Python
 python github_namechecker.py
+vxcf

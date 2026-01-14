@@ -8,6 +8,7 @@
 - 实时显示检测进度和结果
 - 导出检测结果
 - 可生成后直接检测，也可导入文件检测
+- vxcf
 
 ## 系统要求
 - Python 3.6 或更高版本
@@ -17,4 +18,3 @@
 ## 运行代码：
 ```Python
 python github_namechecker.py
-vxcf

@@ -1,212 +1,182 @@
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
 import requests
+import random
+import string
+import time
+import sys
+import urllib3
+import os
 import threading
-from queue import Queue
-from itertools import permutations
 
-# @author：ispxx
+# ---------------- 配置区域 ----------------
+# Clash: 7890, V2Ray/SSR: 1080 或 10809
+PROXY_PORT = 7897
 
-class GitHubCheckerApp:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("GitHub用户名检测工具")
-        self.root.geometry("1000x800")
+# 线程数量
+THREAD_COUNT = 10
 
-        # 状态变量
-        self.running = False
-        self.queue = Queue()
-        self.results = {"available": [], "unavailable": [], "errors": []}
+# 设置要生成的类型：
+# 1 = 纯字母 (4位) - 极难
+# 2 = 字母+数字 (4位) - 容易很多
+MODE = 1
+# ----------------------------------------
 
-        # 创建界面
-        self.create_widgets()
+# 禁用安全警告
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-    def create_widgets(self):
-        # 输入字母生成衍生词区域
-        input_frame = ttk.LabelFrame(self.root, text="输入字母生成衍生词")
-        input_frame.pack(pady=10, padx=10, fill="x")
+# 配置代理
+PROXIES = {
+    "http": f"http://127.0.0.1:{PROXY_PORT}",
+    "https": f"http://127.0.0.1:{PROXY_PORT}",
+}
 
-        self.input_var = tk.StringVar()
-        ttk.Entry(input_frame, textvariable=self.input_var, width=50).grid(row=0, column=0, padx=5)
-        ttk.Button(input_frame, text="生成五位字母", command=lambda: self.generate_words(5)).grid(row=0, column=1)
-        ttk.Button(input_frame, text="生成六位字母", command=lambda: self.generate_words(6)).grid(row=0, column=2)
-        ttk.Button(input_frame, text="检测衍生词", command=self.check_generated_words).grid(row=0, column=3)
+# 全局变量与锁
+total_scanned = 0
+found_count = 0
+start_time = time.time()
+found_names_set = set()  # 用于内存去重
+stop_event = threading.Event()  # 用于优雅停止线程
 
-        # 文件选择区域
-        file_frame = ttk.LabelFrame(self.root, text="文件操作")
-        file_frame.pack(pady=10, padx=10, fill="x")
+# 锁：用于确保打印和文件写入不冲突
+print_lock = threading.Lock()
+file_lock = threading.Lock()
 
-        self.file_path = tk.StringVar()
-        ttk.Entry(file_frame, textvariable=self.file_path, width=50).grid(row=0, column=0, padx=5)
-        ttk.Button(file_frame, text="选择文件", command=self.select_file).grid(row=0, column=1)
-        ttk.Button(file_frame, text="开始检测", command=self.start_check).grid(row=0, column=2, padx=5)
-        ttk.Button(file_frame, text="停止", command=self.stop_check).grid(row=0, column=3)
 
-        # 进度显示
-        self.progress = ttk.Progressbar(self.root, mode='determinate')
-        self.progress.pack(pady=5, fill="x", padx=10)
+def load_existing_names():
+    """启动前读取已保存的用户名，防止重复记录"""
+    if os.path.exists("available_names.txt"):
+        with open("available_names.txt", "r", encoding="utf-8") as f:
+            for line in f:
+                name = line.strip()
+                if name:
+                    found_names_set.add(name)
+        print(f"[*] 已加载历史记录: {len(found_names_set)} 个用户名")
 
-        self.status = ttk.Label(self.root, text="就绪")
-        self.status.pack()
 
-        # 结果展示
-        result_frame = ttk.LabelFrame(self.root, text="检测结果")
-        result_frame.pack(pady=10, fill="both", expand=True, padx=10)
+def get_random_name(mode=1):
+    """生成随机 4 位字符串"""
+    if mode == 1:
+        chars = string.ascii_lowercase
+    else:
+        chars = string.ascii_lowercase + string.digits
+    return ''.join(random.choices(chars, k=4))
 
-        columns = ("username", "status")
-        self.tree = ttk.Treeview(result_frame, columns=columns, show="headings")
-        self.tree.heading("username", text="用户名")
-        self.tree.heading("status", text="状态")
-        self.tree.pack(fill="both", expand=True)
 
-        # 结果导出
-        export_frame = ttk.Frame(self.root)
-        export_frame.pack(pady=10)
-        ttk.Button(export_frame, text="导出可用", command=lambda: self.export_results("available")).grid(row=0,
-                                                                                                         column=0)
-        ttk.Button(export_frame, text="导出不可用", command=lambda: self.export_results("unavailable")).grid(row=0,
-                                                                                                             column=1)
-        ttk.Button(export_frame, text="导出错误", command=lambda: self.export_results("errors")).grid(row=0, column=2)
-
-    def select_file(self):
-        file = filedialog.askopenfilename(filetypes=[("Text files", "*.txt")])
-        self.file_path.set(file)
-
-    def generate_words(self, length):
-        letters = self.input_var.get().strip()
-        if not letters:
-            messagebox.showerror("错误", "请输入字母")
+def save_result(username):
+    """线程安全地写入文件"""
+    with file_lock:
+        # 双重检查：确保写入前没有被其他线程抢先写入（虽然概率极低）
+        if username in found_names_set:
             return
 
-        # 生成指定长度的衍生词
-        words = set()
-        for p in permutations(letters, length):
-            word = "".join(p)
-            words.add(word)
+        found_names_set.add(username)
+        with open("available_names.txt", "a", encoding="utf-8") as f:
+            f.write(f"{username}\n")
 
-        # 显示生成的衍生词
-        self.results = {"available": [], "unavailable": [], "errors": []}
-        self.tree.delete(*self.tree.get_children())
-        for word in words:
-            self.tree.insert("", "end", values=(word, "待检测"))
 
-        self.status.config(text=f"已生成 {len(words)} 个{length}位衍生词")
+def check_github_username(username):
+    url = f"https://github.com/{username}"
+    ua_list = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/91.0.4472.124 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Chrome/92.0.4515.107 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:90.0) Gecko/20100101 Firefox/90.0"
+    ]
+    headers = {"User-Agent": random.choice(ua_list)}
 
-    def check_generated_words(self):
-        # 获取待检测的衍生词
-        words = [self.tree.item(item, "values")[0] for item in self.tree.get_children()]
-        if not words:
-            messagebox.showerror("错误", "没有可检测的衍生词")
-            return
+    try:
+        response = requests.get(url, headers=headers, proxies=PROXIES, verify=False, timeout=10)
+        if response.status_code == 404:
+            return True
+        elif response.status_code == 200:
+            return False
+        elif response.status_code == 429:
+            return "LIMIT"
+        else:
+            return False
+    except:
+        return False
 
-        self.running = True
-        self.results = {"available": [], "unavailable": [], "errors": []}
 
-        # 创建检测线程
-        self.worker = threading.Thread(target=self.run_check, args=(words,))
-        self.worker.start()
-        self.update_progress()
+def worker_thread(thread_id):
+    """工作线程逻辑"""
+    global total_scanned, found_count
 
-    def start_check(self):
-        if not self.file_path.get():
-            messagebox.showerror("错误", "请先选择用户名文件")
-            return
+    while not stop_event.is_set():
+        username = get_random_name(MODE)
 
-        try:
-            with open(self.file_path.get(), "r") as f:
-                usernames = [line.strip() for line in f if line.strip()]
-        except Exception as e:
-            messagebox.showerror("错误", f"文件读取失败: {str(e)}")
-            return
+        # 如果内存里已经有了，直接跳过，不发请求
+        if username in found_names_set:
+            continue
 
-        self.running = True
-        self.results = {"available": [], "unavailable": [], "errors": []}
-        self.tree.delete(*self.tree.get_children())
+        status = check_github_username(username)
 
-        # 创建检测线程
-        self.worker = threading.Thread(target=self.run_check, args=(usernames,))
-        self.worker.start()
-        self.update_progress()
+        # 更新全局计数器
+        # 注意：简单的 += 在多线程下不完全安全，但只用于显示统计误差可接受
+        # 若追求严谨需加锁，但会降低速度
+        total_scanned += 1
 
-    def run_check(self, usernames):
-        total = len(usernames)
-        for idx, username in enumerate(usernames, 1):
-            if not self.running:
-                break
-            try:
-                url = f"https://github.com/{username}"
-                # 禁用SSL验证
-                response = requests.head(url, timeout=5, verify=False)
-                if response.status_code == 404:
-                    status = "可用"
-                    self.results["available"].append(username)
-                else:
-                    status = "不可用"
-                    self.results["unavailable"].append(username)
-                self.queue.put((username, status, idx / total * 100))
-            except Exception as e:
-                self.results["errors"].append(f"{username}: {str(e)}")
-                self.queue.put((username, f"错误: {str(e)}", idx / total * 100))
+        if status is True:
+            # 再次检查是否被重复记录（防止并发写入）
+            if username not in found_names_set:
+                with print_lock:
+                    found_count += 1
+                    print(f"\n[★ T{thread_id}] 发现可用: {username}")
+                    print(f"       注册 -> https://github.com/signup")
+                save_result(username)
 
-    def update_progress(self):
-        while not self.queue.empty():
-            username, status, progress = self.queue.get()
+        elif status == "LIMIT":
+            with print_lock:
+                print(f"\n[!] 线程 T{thread_id} 触发 429 限流，暂停 30 秒...")
+            time.sleep(30)
 
-            # 更新结果
-            if "可用" in status:
-                tag = "success"
-            elif "不可用" in status:
-                tag = "error"
-            else:
-                tag = "warning"
+        # 稍微随机延迟，避免10个线程像DDoS一样攻击GitHub
+        time.sleep(random.uniform(0.5, 1.5))
 
-            # 更新Treeview中的状态
-            for item in self.tree.get_children():
-                if self.tree.item(item, "values")[0] == username:
-                    self.tree.item(item, values=(username, status), tags=(tag,))
-                    break
 
-            self.progress["value"] = progress
-            self.status.config(
-                text=f"已检测: {len(self.results['available'])} 可用, {len(self.results['unavailable'])} 不可用")
+def print_progress():
+    """独立的线程用于刷新进度条，避免多线程打印冲突"""
+    while not stop_event.is_set():
+        elapsed = time.time() - start_time
+        speed = total_scanned / elapsed if elapsed > 0 else 0
 
-        if self.running:
-            self.root.after(100, self.update_progress)
+        # 使用 \r 回车符覆盖当前行
+        msg = f"\r[*] 扫描中... | 总计: {total_scanned} | 命中: {found_count} | 速度: {speed:.1f}次/秒"
+        sys.stdout.write(msg)
+        sys.stdout.flush()
+        time.sleep(0.5)
 
-    def stop_check(self):
-        self.running = False
-        self.status.config(text="检测已停止")
 
-    def export_results(self, category):
-        if not self.results[category]:
-            messagebox.showinfo("提示", f"没有{category}的结果")
-            return
+def main():
+    print("--- GitHub 4位用户名多线程挖掘机 ---")
+    print(f"[*] 模式: {'纯字母' if MODE == 1 else '字母+数字'}")
+    print(f"[*] 线程数: {THREAD_COUNT}")
+    print(f"[*] 代理: 127.0.0.1:{PROXY_PORT}")
 
-        file = filedialog.asksaveasfilename(
-            defaultextension=".txt",
-            filetypes=[("Text files", "*.txt")]
-        )
-        if file:
-            try:
-                with open(file, "w", encoding="utf-8") as f:
-                    if category == "errors":
-                        f.write("\n".join(self.results[category]))
-                    else:
-                        f.write("\n".join(self.results[category]))
-                messagebox.showinfo("成功", f"结果已导出到 {file}")
-            except Exception as e:
-                messagebox.showerror("错误", f"导出失败: {str(e)}")
+    load_existing_names()
+    print("[*] 开始挖掘 (按 Ctrl+C 停止)...\n")
+
+    # 启动工作线程
+    threads = []
+    for i in range(THREAD_COUNT):
+        t = threading.Thread(target=worker_thread, args=(i + 1,))
+        t.daemon = True  # 设置为守护线程，主程序退出时自动结束
+        t.start()
+        threads.append(t)
+
+    # 启动进度显示线程
+    p_thread = threading.Thread(target=print_progress)
+    p_thread.daemon = True
+    p_thread.start()
+
+    try:
+        # 主线程保持运行，直到用户按 Ctrl+C
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("\n\n--- 正在停止所有线程... ---")
+        stop_event.set()
+        print(f"本次运行共找到 {found_count} 个新用户名。")
+        print("请查看 available_names.txt")
 
 
 if __name__ == "__main__":
-    root = tk.Tk()
-    app = GitHubCheckerApp(root)
-
-    # 配置样式
-    style = ttk.Style()
-    style.configure("success.Treeview", foreground="green")
-    style.configure("error.Treeview", foreground="red")
-    style.configure("warning.Treeview", foreground="orange")
-    root.tk_setPalette(background="#f0f0f0")
-
-    root.mainloop()
+    main()
